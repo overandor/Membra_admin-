@@ -1,50 +1,106 @@
 # Membra Admin
 
-Membra Admin is the internal operations console for the MEMBRA ecosystem.
+**Membra Admin is the internal operations console namespace for MEMBRA Labs and the MEMBRA Proof Network.**
 
-It gives operators a controlled place to review campaign creatives, inspect proof submissions, manage media kit status, resolve claims, monitor vendor orders, and check reward readiness.
+It is responsible for the human/operator control layer behind proof review, creative approval, fraud flags, claims, payout holds, vendor oversight, and campaign status control.
 
-## One-line thesis
+## Company Context
 
-Membra Admin turns MEMBRA from a marketplace idea into an operable network with review queues, status gates, audit trails, and release controls.
+- Company: **MEMBRA Labs**
+- Flagship product: **MEMBRA Proof Network**
+- Module: **Membra Admin**
+- Category: operator console, proof review, creative approval, payout oversight, fraud operations
 
-## Role in the ecosystem
+## One-Line Thesis
 
-- `Membra_api` owns source-of-truth records.
-- `Membra_ads` defines the physical ad network workflows.
-- `Membra_mobile` submits owner proof records.
-- `Membra_proofbook` records proof hashes and audit entries.
-- `Membra_wallet` controls payment and reward state.
-- `Membra_vendor_adapters` updates kit and vendor status.
+Membra Admin turns MEMBRA from a marketplace idea into an operable proof network with review queues, status gates, audit trails, and release controls.
 
-## Admin modules
+## Product Role
 
-- creative review
-- asset verification
-- proof review
-- media kit status
-- vendor order status
-- claim handling
+Membra Admin is the control room for the proof-commerce workflow.
+
+It should manage:
+
+- creative approval
+- owner verification status
+- asset verification status
+- proof review queues
+- proof approval/rejection/dispute decisions
+- fraud flags
 - campaign status
-- reward readiness
-- audit timeline
-- operator notes
+- media-kit status
+- vendor order status
+- payout hold/release review
+- claims and dispute handling
+- audit log review
 
-## Core queues
+## Core Workflow
 
-- creatives needing review
-- assets needing verification
-- proofs needing review
-- kits needing action
-- claims needing resolution
-- rewards needing release check
+1. Advertiser submits campaign and creative.
+2. Admin approves or rejects creative.
+3. Owner submits asset or surface.
+4. Admin verifies asset where required.
+5. Media kit is generated.
+6. Owner submits proof.
+7. Admin reviews proof.
+8. Approved proof unlocks payout eligibility.
+9. Disputed proof creates claim workflow.
+10. All state changes create audit records.
 
-## Operator rule
+## Integration Points
 
-No campaign placement becomes active until creative, kit identity, and required proof gates pass.
+| Repo | Integration |
+|---|---|
+| `overandor/Membra_ads` | campaign, asset, media-kit, proof, scan, audit records |
+| `overandor/Membra_wallet` | payout eligibility, holds, releases, failed payouts |
+| `overandor/Membra_proofbook` | proof hashes and audit trail verification |
+| `overandor/Membra_vendor_adapters` | vendor order status and exception handling |
+| `overandor/membra-qr-gateway` | dashboard views that can surface admin-reviewed states |
+| `overandor/Membra_kpi` | operations scorecards and proof review metrics |
 
-No reward release becomes ready until the proof state and payment state agree.
+## Required Admin States
 
-## Current stage
+Proof states:
 
-Operations-console scaffold. Next step is a lightweight FastAPI or React admin dashboard connected to `Membra_api`.
+- `submitted`
+- `approved`
+- `rejected`
+- `disputed`
+- `needs_more_evidence`
+
+Payout states:
+
+- `pending`
+- `eligible`
+- `held`
+- `released`
+- `failed`
+- `reversed`
+
+Campaign states:
+
+- `draft`
+- `creative_review`
+- `approved`
+- `funded`
+- `active`
+- `paused`
+- `complete`
+- `cancelled`
+
+## Safety Rules
+
+- no payout release without approved proof
+- no creative activation without review
+- no manual override without audit record
+- no public exposure of sensitive owner, payment, or identity data
+- no deletion of fraud or dispute evidence without retention policy
+- no unsupported income or performance claims
+
+## Productization Priority
+
+This repo should receive the first internal operator UI after `Membra_ads` and `membra-qr-gateway` are demo-connected.
+
+## Current Stage
+
+Operations-console scaffold. Next step is a lightweight FastAPI or React admin dashboard connected to `Membra_ads` / `Membra_api`.
