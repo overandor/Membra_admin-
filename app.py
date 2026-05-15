@@ -1,13 +1,15 @@
 """MEMBRA Admin — operator console for proof, fraud, campaign, and payout decisions.
 
-This app is a control room for MEMBRA operators. It records review decisions,
-fraud holds, campaign approvals, and payout eligibility decisions with audit logs.
-It does not settle funds; it gates eligibility for external payment rails.
+This app records review decisions, fraud holds, campaign approvals, payout eligibility
+decisions, canonical MEMBRA OS events, and audit logs. It does not settle funds;
+it gates eligibility for external payment rails.
 """
 from __future__ import annotations
 
 import csv
 import datetime as dt
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -21,12 +23,15 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 APP_NAME = "MEMBRA Admin"
+APP_VERSION = "1.1.0"
 DB_PATH = Path(os.getenv("APP_DB_PATH", "/tmp/membra_admin.sqlite3"))
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
-api = FastAPI(title=APP_NAME, version="1.0.0")
+MEMBRA_EVENT_SECRET = os.getenv("MEMBRA_EVENT_SECRET", "")
+api = FastAPI(title=APP_NAME, version=APP_VERSION)
+
 
 class DecisionIn(BaseModel):
-    subject_type: str = Field(description="proof|campaign|payout|relay|wear_kit|asset")
+    subject_type: str = Field(description="proof|campaign|payout|relay|wear_kit|asset|listing")
     subject_id: str
     decision: str = "approved"
     operator: str = "operator"
@@ -35,12 +40,43 @@ class DecisionIn(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class MembraEventIn(BaseModel):
+    event_id: str
+    event_type: str
+    source_module: str
+    subject_type: str
+    subject_id: str
+    owner_id: str | None = None
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    created_at: str
+    consent_scope: str | None = None
+    risk_level: str = "normal"
+    payload: dict[str, Any] = Field(default_factory=dict)
+    proof_hash: str | None = None
+    signature: str | None = None
+
+
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def canonical(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def verify_event_signature(event: dict[str, Any]) -> bool:
+    if not MEMBRA_EVENT_SECRET:
+        return True
+    supplied = event.get("signature") or ""
+    unsigned = dict(event)
+    unsigned["signature"] = None
+    expected = "hmac_sha256:" + hmac.new(MEMBRA_EVENT_SECRET.encode("utf-8"), canonical(unsigned).encode("utf-8"), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(supplied, expected)
 
 
 def db() -> sqlite3.Connection:
@@ -81,7 +117,25 @@ def init_db() -> None:
           metadata_json TEXT,
           created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS events(
+          event_id TEXT PRIMARY KEY,
+          event_type TEXT,
+          source_module TEXT,
+          subject_type TEXT,
+          subject_id TEXT,
+          owner_id TEXT,
+          risk_level TEXT,
+          proof_hash TEXT,
+          signature TEXT,
+          payload_json TEXT,
+          status TEXT,
+          created_at TEXT,
+          ingested_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_admin_events_type ON events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_admin_events_subject ON events(subject_type, subject_id);
         """)
+
 
 init_db()
 
@@ -119,33 +173,73 @@ def record_decision(data: DecisionIn) -> dict[str, Any]:
 
 
 def table(name: str) -> list[dict[str, Any]]:
-    allowed = {"review_queue", "decisions", "audit_events"}
+    allowed = {"review_queue", "decisions", "audit_events", "events"}
     if name not in allowed:
         return []
+    order_col = "ingested_at" if name == "events" else "created_at"
     with db() as conn:
-        rows = conn.execute(f"SELECT * FROM {name} ORDER BY created_at DESC LIMIT 300").fetchall()
+        rows = conn.execute(f"SELECT * FROM {name} ORDER BY {order_col} DESC LIMIT 300").fetchall()
     return [dict(r) for r in rows]
 
 
 def export_decisions() -> str:
-    rows = table("decisions")
+    decision_rows = table("decisions")
     path = "/tmp/membra_admin_decisions.csv"
-    if rows:
+    if decision_rows:
         with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader(); writer.writerows(rows)
+            writer = csv.DictWriter(f, fieldnames=list(decision_rows[0].keys()))
+            writer.writeheader(); writer.writerows(decision_rows)
     else:
         Path(path).write_text("decision_id,subject_type,subject_id,decision\n", encoding="utf-8")
     return path
 
+
+def priority_for_event(data: MembraEventIn) -> str:
+    if data.risk_level in {"high", "blocked"}:
+        return "urgent"
+    if data.event_type in {"visibility_requested", "payout_eligibility_created", "admin_decision_recorded"}:
+        return "high"
+    return "normal"
+
+
 @api.get("/api/health")
 def health():
-    return {"ok": True, "app": APP_NAME, "admin_token_configured": bool(ADMIN_TOKEN)}
+    return {"ok": True, "app": APP_NAME, "version": APP_VERSION, "admin_token_configured": bool(ADMIN_TOKEN)}
+
+
+@api.get("/api/ready")
+def ready():
+    warnings = [] if MEMBRA_EVENT_SECRET else ["MEMBRA_EVENT_SECRET not configured; signed event verification is permissive"]
+    return {"ok": True, "warnings": warnings, "queue_count": len(table("review_queue")), "event_count": len(table("events"))}
+
+
+@api.post("/api/events/ingest")
+def ingest_event(data: MembraEventIn):
+    event = data.model_dump()
+    if not verify_event_signature(event):
+        raise HTTPException(401, "invalid event signature")
+    with db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (data.event_id, data.event_type, data.source_module, data.subject_type, data.subject_id, data.owner_id, data.risk_level, data.proof_hash, data.signature, json.dumps(event, default=str), "ingested", data.created_at, now()),
+        )
+    queued = None
+    if data.event_type in {"visibility_requested", "visibility_confirmed", "payout_eligibility_created", "photo_analyzed", "listing_drafts_created"}:
+        queued = add_to_queue(data.subject_type, data.subject_id, priority_for_event(data))
+        add_audit("event_ingest", f"event:{data.event_type}", data.subject_type, data.subject_id, event)
+    return {"ok": True, "event_id": data.event_id, "queued": queued}
+
+
+@api.get("/api/events")
+def list_events():
+    return {"events": table("events")}
+
 
 @api.post("/api/queue")
 def api_queue(subject_type: str, subject_id: str, priority: str = "normal", authorization: str | None = Header(default=None)):
     require_admin(authorization)
     return add_to_queue(subject_type, subject_id, priority)
+
 
 @api.post("/api/decisions")
 def api_decision(data: DecisionIn, authorization: str | None = Header(default=None)):
@@ -154,6 +248,7 @@ def api_decision(data: DecisionIn, authorization: str | None = Header(default=No
         return record_decision(data)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+
 
 @api.get("/api/{name}")
 def api_table(name: str):
@@ -172,16 +267,17 @@ def ui_decide(subject_type, subject_id, decision, operator, risk, notes, metadat
     except Exception as exc:
         return {"error": str(exc)}, table("decisions"), table("review_queue"), table("audit_events"), None
 
+
 with gr.Blocks(title=APP_NAME) as demo:
-    gr.Markdown("# MEMBRA Admin\nOperator console for proof review, campaign approval, fraud holds, and payout eligibility. Decisions are audit logged.")
+    gr.Markdown("# MEMBRA Admin\nOperator console and canonical event review queue for proof review, campaign approval, fraud holds, and payout eligibility.")
     with gr.Tab("Queue"):
-        q_type = gr.Dropdown(["proof", "campaign", "payout", "relay", "wear_kit", "asset"], label="Subject type", value="proof")
+        q_type = gr.Dropdown(["proof", "campaign", "payout", "relay", "wear_kit", "asset", "listing"], label="Subject type", value="proof")
         q_id = gr.Textbox(label="Subject ID")
         q_priority = gr.Dropdown(["low", "normal", "high", "urgent"], value="normal", label="Priority")
         q_btn = gr.Button("Queue for review", variant="primary")
         q_out = gr.JSON(label="Queued item")
     with gr.Tab("Decision"):
-        d_type = gr.Dropdown(["proof", "campaign", "payout", "relay", "wear_kit", "asset"], label="Subject type", value="proof")
+        d_type = gr.Dropdown(["proof", "campaign", "payout", "relay", "wear_kit", "asset", "listing"], label="Subject type", value="proof")
         d_id = gr.Textbox(label="Subject ID")
         d_decision = gr.Dropdown(["approved", "rejected", "needs_more_evidence", "fraud_hold", "payout_hold", "payout_eligible", "archived"], value="approved", label="Decision")
         d_operator = gr.Textbox(label="Operator", value="operator")
@@ -190,6 +286,9 @@ with gr.Blocks(title=APP_NAME) as demo:
         d_meta = gr.Code(label="Metadata JSON", language="json", value="{}")
         d_btn = gr.Button("Record decision", variant="primary")
         d_out = gr.JSON(label="Decision")
+    with gr.Tab("Events"):
+        gr.Markdown("Canonical MEMBRA events arrive through `/api/events/ingest` and may create review queue items.")
+        gr.Dataframe(label="Events", value=lambda: table("events"), interactive=False)
     queue_table = gr.Dataframe(label="Review queue", value=lambda: table("review_queue"), interactive=False)
     decisions_table = gr.Dataframe(label="Decisions", value=lambda: table("decisions"), interactive=False)
     audit_table = gr.Dataframe(label="Audit events", value=lambda: table("audit_events"), interactive=False)
